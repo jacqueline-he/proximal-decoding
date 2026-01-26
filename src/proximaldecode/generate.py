@@ -159,7 +159,7 @@ class ProximalDecodingFactory:
         self.eps_kl = eps_kl
         self.solver_max_iter = solver_max_iter
 
-        print(f"[INFO] Banking ACP Fuse w/ k_radius: {k_radius}")
+        print(f"[INFO] Using per-step budget: {k_radius}")
 
         assert self.k_radius >= 0.0, "k_radius must be positive"
 
@@ -167,7 +167,7 @@ class ProximalDecodingFactory:
 
         self.use_prefix_debt = use_prefix_debt
         if self.use_prefix_debt is not None:
-            print(f"[INFO]: Use prefix debt enabled")
+            print(f"[INFO]: Prefix debt enabled")
 
         # Device management
         self.device = device or next(self.safe_model.parameters()).device
@@ -221,7 +221,7 @@ class ProximalDecodingFactory:
             inputs = self.tokenizer(text, return_tensors="pt", padding=True).to(self.device)
             input_ids = inputs.input_ids
             attention_mask = inputs.attention_mask
-
+        
         if input_ids is None:
             raise ValueError("Either `text` or `input_ids` must be provided.")
 
@@ -231,16 +231,17 @@ class ProximalDecodingFactory:
         if generation_config.eos_token_id is None:
             generation_config.eos_token_id = self.tokenizer.eos_token_id
 
+        # Prepare attention masks and special tokens
+        attention_mask = self._prepare_attention_mask(input_ids, attention_mask, generation_config)
+
         # Input validation
-        self._validate_generate_inputs(input_ids, generation_config)
+        self._validate_generate_inputs(input_ids, generation_config, attention_mask=attention_mask)
 
         # Move input_ids and attention_mask to the correct device
         input_ids = input_ids.to(self.device)
         if attention_mask is not None:
             attention_mask = attention_mask.to(self.device)
 
-        # Prepare attention masks and special tokens
-        attention_mask = self._prepare_attention_mask(input_ids, attention_mask, generation_config)
         pad_token_id = self._prepare_pad_token_id(generation_config)
         eos_token_id = generation_config.eos_token_id
 
@@ -272,12 +273,14 @@ class ProximalDecodingFactory:
         self,
         input_ids: torch.Tensor,
         generation_config: GenerationConfig,
+        attention_mask: Optional[torch.Tensor] = None,
     ) -> None:
         """Validate inputs for the generate method.
 
         Args:
             input_ids (torch.Tensor): Input token IDs.
             generation_config (GenerationConfig): Configuration for generation.
+            attention_mask (Optional[torch.Tensor]): Attention mask.
 
         Raises:
             ValueError: If any of the validation checks fail.
@@ -289,7 +292,12 @@ class ProximalDecodingFactory:
             if not (isinstance(generation_config.max_new_tokens, int) and generation_config.max_new_tokens > 0):
                 raise ValueError("`max_new_tokens` should be a strictly positive integer.")
             # Calculate the max length based on max_new_tokens and the input length
-            max_length = input_ids.shape[1] + generation_config.max_new_tokens
+            # Use the actual sequence length (ignoring padding) if possible
+            if attention_mask is not None:
+                input_len = attention_mask.sum(dim=-1).max().item()
+            else:
+                input_len = input_ids.shape[1]
+            max_length = int(input_len + generation_config.max_new_tokens)
             # Overwrite max_length with max_new_tokens value if it's smaller
             generation_config.max_length = max_length
         else:

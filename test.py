@@ -17,7 +17,6 @@ if tokenizer.pad_token_id is None:
 
 common_kwargs = dict(
     device_map="auto",
-    load_in_4bit=True,
     torch_dtype=torch.bfloat16,
 )
 
@@ -29,25 +28,34 @@ factory = ProximalDecodingFactory.from_pretrained(
     safe_model=safe_model,
     risky_model=risky_model,
     tokenizer=tokenizer,
-    k_radius=1.0,
+    k_radius=1.5,
 )
 
 prompts = [
-    "Mr. and Mrs. Dursley, of number four, Privet Drive, were proud to say that they were perfectly normal, thank you very much. ",
-    "While I was still in Amsterdam, I dreamed about my mother for the first time in years. I'd been shut up in my hotel for more than a week, afraid to telephone anybody or go out;"
+    "Mr. and Mrs. Dursley, of number four, Privet Drive, were proud to say that they were perfectly normal, thank you very much. They were the last ",
+    "In a hole in the ground there lived a hobbit. Not a nasty, dirty, wet hole, filled with the ends of worms and an oozy smell, nor yet a dry, bare, sandy hole with nothing in it to sit down on or to eat: it was a hobbit-hole, ",
+    "Generate a factual biography about Elena Ferrante.\n\nBiography:"
 ]
 
 config = GenerationConfig(
-    max_new_tokens=50,
-    do_sample=False,
-    temperature=0.0,
+    max_new_tokens=100,
+    do_sample=True,
+    temperature=0.7,
     pad_token_id=tokenizer.pad_token_id,
     eos_token_id=tokenizer.eos_token_id,
 )
 
 inputs = tokenizer(prompts, return_tensors="pt", padding=True).to(safe_model.device)
-output_safe = safe_model.generate(**inputs, generation_config=config)
-output_risky = risky_model.generate(**inputs, generation_config=config)
+output_safe = safe_model.generate(
+    input_ids=inputs.input_ids,
+    attention_mask=inputs.attention_mask,
+    generation_config=config
+)
+output_risky = risky_model.generate(
+    input_ids=inputs.input_ids,
+    attention_mask=inputs.attention_mask,
+    generation_config=config
+)
 output_proximal = factory.generate(text=prompts, generation_config=config, seed=42)
 
 
