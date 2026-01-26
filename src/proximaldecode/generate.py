@@ -38,8 +38,11 @@ class ProximalDecodingFactory:
     @classmethod
     def from_pretrained(
         cls,
-        safe_model_path: str,
-        risky_model_path: str,
+        safe_model_path: Optional[str] = None,
+        risky_model_path: Optional[str] = None,
+        safe_model: Optional[torch.nn.Module] = None,
+        risky_model: Optional[torch.nn.Module] = None,
+        tokenizer: Optional[AutoTokenizer] = None,
         k_radius: float = 0.15,
         verbose: bool = False,
         use_prefix_debt: bool = True,
@@ -50,35 +53,57 @@ class ProximalDecodingFactory:
         device_map: str = "auto",
         trust_remote_code: bool = True,
         max_memory: Optional[dict] = None,
+        load_in_4bit: bool = False,
+        load_in_8bit: bool = False,
         **kwargs,
     ):
         """
-        Class method to initialize the factory directly from model paths.
+        Class method to initialize the factory directly from model paths or existing models.
         """
         if use_prefix_debt:
             assert prefix_n is not None, "prefix_n must be set when use_prefix_debt is True"
         
-        tokenizer = init_tokenizer(safe_model_path, trust_remote_code=trust_remote_code)
+        if tokenizer is None:
+            if safe_model_path is None:
+                raise ValueError("tokenizer or safe_model_path must be provided")
+            tokenizer = init_tokenizer(safe_model_path, padding_side="left", trust_remote_code=trust_remote_code)
 
         common_load = dict(
-            torch_dtype=torch_dtype,
-            low_cpu_mem_usage=True,
-            use_safetensors=True,
-            trust_remote_code=trust_remote_code,
-            device_map=device_map,
-            max_memory=max_memory,
-            **kwargs,
-        )
+                torch_dtype=torch_dtype,
+                low_cpu_mem_usage=True,
+                use_safetensors=True,
+                trust_remote_code=trust_remote_code,
+                device_map=device_map,
+                max_memory=max_memory,
+                load_in_4bit=load_in_4bit,
+                load_in_8bit=load_in_8bit,
+                **kwargs,
+            )
 
-        safe_model = AutoModelForCausalLM.from_pretrained(safe_model_path, **common_load)
-        risky_model = AutoModelForCausalLM.from_pretrained(risky_model_path, **common_load)
+        if safe_model is None:
+            if safe_model_path is None:
+                raise ValueError("safe_model or safe_model_path must be provided")
+            safe_model = AutoModelForCausalLM.from_pretrained(safe_model_path, **common_load)
+        
+        if risky_model is None:
+            if risky_model_path is None:
+                raise ValueError("risky_model or risky_model_path must be provided")
+            risky_model = AutoModelForCausalLM.from_pretrained(risky_model_path, **common_load)
 
         # Only resize if vocab actually differs
         target_vocab = len(tokenizer)
         if safe_model.get_input_embeddings().weight.shape[0] != target_vocab:
-            safe_model.resize_token_embeddings(target_vocab)
+            raise ValueError(
+                f"Safe model vocab size ({safe_model.get_input_embeddings().weight.shape[0]}) "
+                f"does not match tokenizer vocab size ({target_vocab}). "
+                "Please use byte-level decoding (Coming soon...)"
+            )
         if risky_model.get_input_embeddings().weight.shape[0] != target_vocab:
-            risky_model.resize_token_embeddings(target_vocab)
+            raise ValueError(
+                f"Risky model vocab size ({risky_model.get_input_embeddings().weight.shape[0]}) "
+                f"does not match tokenizer vocab size ({target_vocab}). "
+                "Please use byte-level decoding (Coming soon...)"
+            )
 
         # Pad/EOS ids
         for mdl in (safe_model, risky_model):
@@ -1237,7 +1262,7 @@ def generate(
         'log_kl_stats', 'verbose', 'device',
         'eps_kl', 'solver_max_iter',
         'torch_dtype', 'device_map', 'trust_remote_code', 'max_memory',
-        'seed'
+        'seed', 'load_in_4bit', 'load_in_8bit'
     }
     
     factory_kwargs = {k: v for k, v in kwargs.items() if k in factory_args}
