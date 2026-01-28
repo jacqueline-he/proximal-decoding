@@ -7,8 +7,9 @@ import torch
 
 console = Console()
 
-safe_model_path = "jacquelinehe/comma-1.7b-v5"
-risky_model_path = "meta-llama/Llama-3.1-8B"
+# @ TODO enter here
+safe_model_path = ""
+risky_model_path = ""
 
 console.print("[bold blue]Loading models and tokenizer...")
 tokenizer = AutoTokenizer.from_pretrained(safe_model_path, padding_side="left")

@@ -7,8 +7,9 @@ import torch
 
 console = Console()
 
-safe_model_path = "common-pile/comma-v0.1-2t"
-risky_model_path = "meta-llama/Llama-3.1-70B"
+# @ TODO enter here
+safe_model_path = ""
+risky_model_path = ""
 
 console.print("[bold blue]Loading models...")
 common_kwargs = dict(device_map="auto", torch_dtype=torch.bfloat16)
