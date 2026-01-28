@@ -68,7 +68,38 @@ class ProximalDecodingFactory:
                 raise ValueError("tokenizer or safe_model_path must be provided")
             tokenizer = init_tokenizer(safe_model_path, padding_side="left", trust_remote_code=trust_remote_code)
 
-        common_load = dict(
+        # Detect GPU configuration for optimal model placement
+        num_gpus = torch.cuda.device_count()
+        print(f"[INFO] ProximalDecoding: Detected {num_gpus} GPUs")
+        
+        if num_gpus >= 2 and safe_model is None and risky_model is None:
+            # Best config: put each model on its own GPU for parallel inference
+            # GPU 0: risky model (typically larger), GPU 1: safe model (typically smaller)
+            print(f"[INFO] Loading risky model on cuda:0, safe model on cuda:1")
+            risky_load = dict(
+                torch_dtype=torch_dtype,
+                low_cpu_mem_usage=True,
+                use_safetensors=True,
+                trust_remote_code=trust_remote_code,
+                device_map={"": 0},  # Entire model on GPU 0
+                load_in_4bit=load_in_4bit,
+                load_in_8bit=load_in_8bit,
+                **kwargs,
+            )
+            safe_load = dict(
+                torch_dtype=torch_dtype,
+                low_cpu_mem_usage=True,
+                use_safetensors=True,
+                trust_remote_code=trust_remote_code,
+                device_map={"": 1},  # Entire model on GPU 1
+                load_in_4bit=load_in_4bit,
+                load_in_8bit=load_in_8bit,
+                **kwargs,
+            )
+        else:
+            # Single GPU or pre-loaded models: use provided device_map
+            print(f"[INFO] Using device_map={device_map}")
+            common_load = dict(
                 torch_dtype=torch_dtype,
                 low_cpu_mem_usage=True,
                 use_safetensors=True,
@@ -79,16 +110,17 @@ class ProximalDecodingFactory:
                 load_in_8bit=load_in_8bit,
                 **kwargs,
             )
+            risky_load = safe_load = common_load
 
         if safe_model is None:
             if safe_model_path is None:
                 raise ValueError("safe_model or safe_model_path must be provided")
-            safe_model = AutoModelForCausalLM.from_pretrained(safe_model_path, **common_load)
+            safe_model = AutoModelForCausalLM.from_pretrained(safe_model_path, **safe_load)
         
         if risky_model is None:
             if risky_model_path is None:
                 raise ValueError("risky_model or risky_model_path must be provided")
-            risky_model = AutoModelForCausalLM.from_pretrained(risky_model_path, **common_load)
+            risky_model = AutoModelForCausalLM.from_pretrained(risky_model_path, **risky_load)
 
         # Only resize if vocab actually differs
         target_vocab = len(tokenizer)
@@ -464,11 +496,11 @@ class ProximalDecodingFactory:
         ).sum(dim=-1).clamp(min=0.0)
 
     @torch.no_grad()
-    def forward_direct(self, model, input_ids, attention_mask, past_key_values):
+    def forward_direct(self, model, input_ids, attention_mask, past_key_values, move_to_device=None):
         """Direct forward pass, bypassing prepare_inputs_for_generation complexity."""
         dev = next(model.parameters()).device
-        ids = input_ids.to(dev)
-        mask = attention_mask.to(dev) if attention_mask is not None else None
+        ids = input_ids.to(dev, non_blocking=True)
+        mask = attention_mask.to(dev, non_blocking=True) if attention_mask is not None else None
 
         if past_key_values is None:
             # Prefill: process all tokens
@@ -483,7 +515,9 @@ class ProximalDecodingFactory:
                 return_dict=True,
             )
 
-        logits = out.logits[:, -1, :].to(self.device)
+        logits = out.logits[:, -1, :]
+        if move_to_device is not None:
+            logits = logits.to(move_to_device)
         pkv = out.past_key_values
         del out
         return logits, pkv
@@ -528,11 +562,12 @@ class ProximalDecodingFactory:
         if self.log_kl_stats:
             self.kl_stats_history = []
 
-        # EOS handling
+        # EOS handling - cache tensor for loop efficiency
         if isinstance(eos_token_id, int):
             eos_token_id_list = [eos_token_id]
         else:
             eos_token_id_list = list(eos_token_id)
+        eos_token_id_tensor = torch.tensor(eos_token_id_list, device=self.device)
 
         batch_size, prompt_len = input_ids.shape
         this_peer_finished = False
@@ -682,7 +717,8 @@ class ProximalDecodingFactory:
                     risky_pkv_in = risky_past_key_values
 
                 # Forward passes
-                if parallelize:
+                if parallelize and self.safe_device != self.risky_device:
+                    # Launch both forwards in parallel streams (only if on different devices)
                     with torch.cuda.stream(stream1):
                         safe_logits, safe_past_key_values = self.forward_direct(
                             self.safe_model, input_ids, attention_mask, safe_pkv_in
@@ -709,14 +745,18 @@ class ProximalDecodingFactory:
                 # Reuse precomputed logits from beginning, set to false 
                 use_precomputed_logits = False 
 
-            # Apply logits processors BEFORE solve
-            safe_logits = logits_processor(input_ids, safe_logits.clone())
-            risky_logits = logits_processor(input_ids, risky_logits.clone())
+            # Move logits to same device for fusion (risky model is typically larger/primary)
+            if safe_logits.device != risky_logits.device:
+                safe_logits = safe_logits.to(risky_logits.device)
+
+            # Apply logits processors BEFORE solve (no clone needed - processors return new tensors)
+            safe_logits = logits_processor(input_ids, safe_logits)
+            risky_logits = logits_processor(input_ids, risky_logits)
 
             # Apply warpers (temperature is OK) BEFORE solve
             if logits_warper is not None and len(logits_warper) > 0:
-                safe_logits = logits_warper(input_ids, safe_logits.clone())
-                risky_logits = logits_warper(input_ids, risky_logits.clone())
+                safe_logits = logits_warper(input_ids, safe_logits)
+                risky_logits = logits_warper(input_ids, risky_logits)
 
             # Enforce min_new_tokens by banning EOS BEFORE solve
             generated_tokens = input_ids.shape[1] - prompt_len
@@ -828,8 +868,7 @@ class ProximalDecodingFactory:
 
             # EOS handling + unfinished mask update
             if eos_token_id is not None:
-                is_eos_token = next_tokens.unsqueeze(-1) == torch.tensor(eos_token_id_list, device=next_tokens.device)
-                is_eos_token = is_eos_token.any(dim=-1)
+                is_eos_token = (next_tokens.unsqueeze(-1) == eos_token_id_tensor).any(dim=-1)
 
                 next_tokens = next_tokens * unfinished_sequences + pad_token_id * (1 - unfinished_sequences)
                 unfinished_sequences = unfinished_sequences * (~is_eos_token).long()
